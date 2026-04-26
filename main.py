@@ -11,7 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit, OptimizeWarning
-from scipy.stats import bartlett, levene, ttest_ind
+from scipy.stats import bartlett, levene, pearsonr, ttest_ind
 import statsmodels.api as sm
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.sandbox.stats.runs import runstest_1samp
@@ -159,16 +159,16 @@ def save_acf_pacf_plots(series: pd.Series, title_prefix: str, acf_path: Path, pa
     plt.close(fig)
 
 
-def infer_model_type(series: pd.Series, window: int = 24 * 7) -> tuple[str, float]:
+def infer_model_type(series: pd.Series, window: int = 24 * 7) -> tuple[str, float, float]:
     rolling_mean = series.rolling(window=window, min_periods=max(10, window // 3)).mean()
     rolling_std = series.rolling(window=window, min_periods=max(10, window // 3)).std()
     joined = pd.concat([rolling_mean, rolling_std], axis=1).dropna()
     if len(joined) < 10:
-        return "additive", 0.0
+        return "additive", 0.0, np.nan
 
-    corr = joined.iloc[:, 0].corr(joined.iloc[:, 1])
+    corr, corr_pvalue = pearsonr(joined.iloc[:, 0], joined.iloc[:, 1])
     model = "multiplicative" if corr > 0.5 and (series > 0).all() else "additive"
-    return model, float(corr)
+    return model, float(corr), float(corr_pvalue)
 
 
 def fit_trend_models(t: np.ndarray, y: np.ndarray) -> list[TrendModel]:
@@ -284,6 +284,32 @@ def quality_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     return {"MAE": mae, "RMSE": rmse, "MAPE": mape}
 
 
+def format_p_value(value: float) -> str:
+    if np.isnan(value):
+        return "nan"
+    if value == 0.0:
+        return "< 1.00e-300"
+    return f"{value:.2e}"
+
+
+def build_monthly_profile(
+    series: pd.Series,
+    model_type: str,
+) -> pd.Series:
+    if model_type == "additive":
+        monthly_profile = series.groupby(series.index.month).mean()
+        monthly_profile = monthly_profile - monthly_profile.mean()
+    else:
+        monthly_profile = series.groupby(series.index.month).mean()
+        profile_mean = monthly_profile.mean()
+        if pd.notna(profile_mean) and abs(profile_mean) > 1e-9:
+            monthly_profile = monthly_profile / profile_mean
+        else:
+            monthly_profile = pd.Series(1.0, index=monthly_profile.index)
+
+    return monthly_profile.reindex(range(1, 13)).interpolate(limit_direction="both").bfill().ffill()
+
+
 def run_full_analysis(series_hourly: pd.Series) -> None:
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -301,6 +327,7 @@ def run_full_analysis(series_hourly: pd.Series) -> None:
     for freq_name, (s, ma_window) in freq_map.items():
         report_lines.append(f"\n[{freq_name.upper()}]")
         report_lines.append(f"Длина ряда: {len(s)}")
+        report_lines.append(f"Проверка стационарности выполнена для частоты {freq_name}.")
 
         save_series_plot(
             s,
@@ -335,10 +362,19 @@ def run_full_analysis(series_hourly: pd.Series) -> None:
             report_lines.append("Вывод: явных неслучайных компонент по выбранным тестам не обнаружено.")
 
     report_lines.append("\n" + "=" * 60)
-    report_lines.append("Декомпозиция и прогноз (почасовой ряд)")
+    report_lines.append("Декомпозиция и прогноз почасового ряда с суточной и месячной сезонностью")
 
-    model_type, amp_corr = infer_model_type(series_hourly)
-    report_lines.append(f"Выбран тип модели: {model_type} (corr(rolling_mean, rolling_std)={amp_corr:.4f})")
+    model_type, amp_corr, amp_corr_pvalue = infer_model_type(series_hourly)
+    report_lines.append(
+        "Выбран тип модели: "
+        f"{model_type} (corr(rolling_mean, rolling_std)={amp_corr:.4f}, p-value={format_p_value(amp_corr_pvalue)})"
+    )
+    if np.isnan(amp_corr_pvalue):
+        report_lines.append("Вывод по типу модели: недостаточно данных для оценки статистической значимости корреляции.")
+    elif amp_corr_pvalue < 0.05:
+        report_lines.append("Вывод по типу модели: корреляция статистически значима на уровне 0.05.")
+    else:
+        report_lines.append("Вывод по типу модели: статистически значимая связь не подтверждена на уровне 0.05.")
 
     control_start = series_hourly.index.max().to_period("M").to_timestamp()
     train = series_hourly[series_hourly.index < control_start]
@@ -348,27 +384,48 @@ def run_full_analysis(series_hourly: pd.Series) -> None:
     report_lines.append(f"Контрольный отрезок: {control.index.min()} .. {control.index.max()} ({len(control)} точек)")
 
     decomposition = seasonal_decompose(train, model=model_type, period=24, extrapolate_trend="freq")
-    trend_comp = decomposition.trend.interpolate().bfill().ffill()
     seasonal_comp = decomposition.seasonal
 
     if model_type == "additive":
-        deseasonalized = train - seasonal_comp
+        day_deseasonalized = train - seasonal_comp
     else:
-        deseasonalized = train / seasonal_comp.replace(0, np.nan)
-        deseasonalized = deseasonalized.interpolate().bfill().ffill()
+        day_deseasonalized = train / seasonal_comp.replace(0, np.nan)
+        day_deseasonalized = day_deseasonalized.interpolate().bfill().ffill()
+
+    monthly_profile = build_monthly_profile(day_deseasonalized, model_type=model_type)
+    monthly_profile_str = ", ".join(f"{month}:{value:.4f}" for month, value in monthly_profile.items())
+    report_lines.append(f"Месячная сезонность (профиль по месяцам): {monthly_profile_str}")
+
+    monthly_train_component = train.index.month.map(monthly_profile).values
+    if model_type == "additive":
+        deseasonalized = day_deseasonalized - monthly_train_component
+    else:
+        safe_monthly = np.where(np.abs(monthly_train_component) < 1e-9, np.nan, monthly_train_component)
+        deseasonalized = day_deseasonalized / safe_monthly
+        deseasonalized = deseasonalized.replace([np.inf, -np.inf], np.nan).interpolate().bfill().ffill()
 
     t_train = np.arange(1, len(deseasonalized) + 1, dtype=float)
     trend_models = fit_trend_models(t_train, deseasonalized.values)
     best_model = trend_models[0]
+    trend_fitted_train = best_model.predict(t_train)
 
     report_lines.append("\nКандидаты тренда (по возрастанию AIC):")
     for tm in trend_models:
-        pvals_str = ", ".join(f"{p:.4g}" for p in tm.pvalues)
+        pvals_str = ", ".join(format_p_value(float(p)) for p in tm.pvalues)
         report_lines.append(
             f"- {tm.name}: AIC={tm.aic:.3f}, BIC={tm.bic:.3f}, RSS={tm.rss:.3f}, p-values=[{pvals_str}], {tm.formula}"
         )
 
     report_lines.append(f"Выбран тренд: {best_model.name}")
+    best_model_pvals = ", ".join(format_p_value(float(p)) for p in best_model.pvalues)
+    best_model_max_p = float(np.max(best_model.pvalues))
+    significance_conclusion = (
+        "все коэффициенты статистически значимы на уровне 0.05"
+        if best_model_max_p < 0.05
+        else "не все коэффициенты статистически значимы на уровне 0.05"
+    )
+    report_lines.append(f"p-values выбранного тренда: [{best_model_pvals}]")
+    report_lines.append(f"Вывод по значимости коэффициентов: {significance_conclusion}.")
 
     sinus_ok = True
     try:
@@ -392,25 +449,30 @@ def run_full_analysis(series_hourly: pd.Series) -> None:
     else:
         seasonal_forecast = control.index.hour.map(seasonal_profile).values
 
+    monthly_forecast = control.index.month.map(monthly_profile).values
+
     if model_type == "additive":
-        y_pred = trend_forecast + seasonal_forecast
-        final_formula = "Y(t) = Trend(t) + S(t) + e(t)"
+        y_pred = trend_forecast + seasonal_forecast + monthly_forecast
+        final_formula = "Y(t) = Trend(t) + S_day(t) + S_month(t) + e(t)"
     else:
-        y_pred = trend_forecast * seasonal_forecast
-        final_formula = "Y(t) = Trend(t) * S(t) * e(t)"
+        y_pred = trend_forecast * seasonal_forecast * monthly_forecast
+        final_formula = "Y(t) = Trend(t) * S_day(t) * S_month(t) * e(t)"
 
     metrics = quality_metrics(control.values, y_pred)
 
     report_lines.append("\nИтоговая модель декомпозиции:")
     report_lines.append(final_formula)
     report_lines.append(f"Trend(t): {best_model.formula}")
+    report_lines.append(f"p-values коэффициентов Trend(t): [{best_model_pvals}]")
+    report_lines.append("S_day(t): суточная сезонность, оцененная по часовому профилю/синусоиде с period=24.")
+    report_lines.append("S_month(t): месячная сезонность, оцененная как профиль по месяцам календарного года.")
+    report_lines.append("Trend(t) оценивался по ряду после исключения и суточной, и месячной сезонности.")
 
     report_lines.append("\nТочность прогноза на контрольном отрезке (последний месяц):")
     for k, v in metrics.items():
         report_lines.append(f"{k}: {v:.6f}")
 
     plt.figure(figsize=(14, 5))
-    plt.plot(train.index, train.values, label="Train", linewidth=1)
     plt.plot(control.index, control.values, label="Control (fact)", linewidth=1.5)
     plt.plot(control.index, y_pred, label="Forecast", linewidth=1.5)
     plt.title("Прогноз на контрольный месяц")
@@ -422,8 +484,8 @@ def run_full_analysis(series_hourly: pd.Series) -> None:
     plt.close()
 
     plt.figure(figsize=(14, 5))
-    plt.plot(train.index, deseasonalized.values, label="Ряд без сезонности", linewidth=1)
-    plt.plot(train.index, best_model.predict(t_train), label=f"Тренд: {best_model.name}", linewidth=2)
+    plt.plot(train.index, deseasonalized.values, label="Ряд без суточной и месячной сезонности", linewidth=1)
+    plt.plot(train.index, trend_fitted_train, label=f"Тренд: {best_model.name}", linewidth=2)
     plt.title("Подгонка тренда на обучающем отрезке")
     plt.xlabel("Дата")
     plt.ylabel("kWh")
@@ -433,9 +495,9 @@ def run_full_analysis(series_hourly: pd.Series) -> None:
     plt.close()
 
     report_lines.append("\nОбщие выводы:")
-    report_lines.append("1) На большинстве частот выявляются неслучайные компоненты (тренд/сезонность) по тестам и корреляционной структуре.")
-    report_lines.append("2) Для почасового ряда построена декомпозиционная модель с суточной сезонностью (period=24) и выбранным трендом.")
-    report_lines.append("3) Прогноз на декабрь 2014 сформирован как сумма/произведение тренда и сезонности, ошибка оценена по MAE/RMSE/MAPE.")
+    report_lines.append("1) Проверка стационарности выполнена отдельно для 4 частот дискретизации: часы, дни, недели и месяцы.")
+    report_lines.append("2) Для почасового ряда построена декомпозиционная модель с суточной и месячной сезонностью и выбранным трендом.")
+    report_lines.append("3) Прогноз на декабрь 2014 сформирован как комбинация тренда, суточной и месячной сезонности; ошибка оценена по MAE/RMSE/MAPE.")
 
     REPORT_PATH.write_text("\n".join(report_lines), encoding="utf-8")
 
